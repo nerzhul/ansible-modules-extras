@@ -67,17 +67,16 @@ options:
     ssl:
         description:
             - Whether to use an SSL connection when connecting to the database
-        default: False
+        required: false
+        default: false
     param:
         description:
             - MongoDB administrative parameter to modify
         required: true
-        default: null
     value:
         description:
             - MongoDB administrative parameter value to set
         required: true
-        default: null
     param_type:
         description:
             - Define the parameter value (str, int)
@@ -97,10 +96,6 @@ EXAMPLES = '''
 '''
 
 RETURN = '''
-changed:
-    description: If module has changed MongoDB parameter
-    returned: success
-    type: string
 before:
     description: value before modification
     returned: success
@@ -158,21 +153,19 @@ def main():
         argument_spec=dict(
             login_user=dict(default=None),
             login_password=dict(default=None),
-            login_host=dict(default='localhost'),
-            login_port=dict(default='27017'),
+            login_host=dict(default='localhost', no_log=True),
+            login_port=dict(default=27017, type='int'),
             login_database=dict(default=None),
             replica_set=dict(default=None),
             param=dict(default=None),
             value=dict(default=None),
-            param_type=dict(default="str"),
-            ssl=dict(default=False),
+            param_type=dict(default="str", choices=['str', 'int']),
+            ssl=dict(default=False, type='bool'),
         )
     )
 
     if not pymongo_found:
         module.fail_json(msg='the python pymongo module is required')
-
-    valid_param_types = ['str', 'int']
 
     login_user = module.params['login_user']
     login_password = module.params['login_password']
@@ -186,15 +179,6 @@ def main():
     param = module.params['param']
     param_type = module.params['param_type']
     value = module.params['value']
-
-    if param is None:
-        module.fail_json(msg='Cannot run without param option')
-
-    if value is None:
-        module.fail_json(msg='Cannot run without value option')
-
-    if param_type not in valid_param_types:
-        module.fail_json(msg='param_type should have one of the following value: %s' % str(valid_param_types))
 
     # Verify parameter is coherent with specified type
     try:
