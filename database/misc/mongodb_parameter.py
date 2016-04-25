@@ -157,8 +157,8 @@ def main():
             login_port=dict(default=27017, type='int'),
             login_database=dict(default=None),
             replica_set=dict(default=None),
-            param=dict(default=None),
-            value=dict(default=None),
+            param=dict(default=None, required=True),
+            value=dict(default=None, required=True),
             param_type=dict(default="str", choices=['str', 'int']),
             ssl=dict(default=False, type='bool'),
         )
