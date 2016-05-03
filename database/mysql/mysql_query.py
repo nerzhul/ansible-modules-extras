@@ -30,7 +30,7 @@ module: mysql_query
 short_description: Execute SQL requests
 description:
     - Execute a single SQL query or single SQL file on a MySQL server
-version_added: "2.1"
+version_added: "2.2"
 author: "Loic Blot (@nerzhul)"
 options:
     db:
