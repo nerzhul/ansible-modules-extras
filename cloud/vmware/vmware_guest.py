@@ -1,5 +1,8 @@
 #!/usr/bin/python
 # -*- coding: utf-8 -*-
+#
+# This module is also sponsored by E.T.A.I. (www.etai.fr)
+#
 # This file is part of Ansible
 #
 # Ansible is free software: you can redistribute it and/or modify
@@ -29,7 +32,9 @@ description:
     - poweron/poweroff/restart a virtualmachine
     - remove a virtualmachine
 version_added: 2.2
-author: James Tanner (@jctanner) <tanner.jc@gmail.com>
+author:
+    - James Tanner (@jctanner) <tanner.jc@gmail.com>
+    - Loic Blot (@nerzhul) <loic.blot@unix-experience.fr>
 notes:
     - Tested on vSphere 6.0
 requirements:
@@ -47,7 +52,7 @@ options:
         required: True
    name_match:
         description:
-            - If multiple vms matching the name, use the first or last found 
+            - If multiple vms matching the name, use the first or last found
         required: False
         default: 'first'
         choices: ['first', 'last']
@@ -58,9 +63,16 @@ options:
         required: False
    template:
         description:
-            - Name of the template to deploy, if needed to create the guest (state=present).
+            - Template used to create guest.
+            - If this value is not set, VM is created without using a template.
             - If the guest exists already this setting will be ignored.
         required: False
+   template_flag:
+        description:
+            - Flag the instance as a template
+        required: False
+        default: False
+        version_added: "2.3"
    folder:
         description:
             - Destination folder path for the new guest
@@ -72,10 +84,6 @@ options:
    disk:
         description:
             - A list of disks to add
-        required: False
-   nic:
-        description:
-            - A list of nics to add
         required: False
    wait_for_ip_address:
         description:
@@ -89,6 +97,11 @@ options:
         description:
             - Destination datacenter for the deploy operation
         required: True
+   cluster:
+        description:
+            - The cluster name where the VM will run.
+        required: False
+        version_added: "2.3"
    esxi_hostname:
         description:
             - The esxi hostname where the VM will run.
@@ -100,15 +113,10 @@ options:
         version_added: "2.3"
    customize:
         description:
-           - Should customization spec be run
+           - Should customization spec be applied. This is only used when deploying a template.
         required: False
         version_added: "2.3"
-   ips:
-        description:
-           - IP Addresses to set
-        required: False
-        version_added: "2.3"
-   networks:    
+   networks:
         description:
           - Network to use should include VM network name and gateway
         required: False
@@ -118,7 +126,7 @@ options:
           - DNS servers to use
         required: False
         version_added: "2.3"
-   domain: 
+   domain:
         description:
           - Domain to use while customizing
         required: False
@@ -128,7 +136,7 @@ options:
           - A key, value pair of snapshot operation types and their additional required parameters.
         required: False
         version_added: "2.3"
-extends_documentation_fragment: vmware.documentation    
+extends_documentation_fragment: vmware.documentation
 '''
 
 EXAMPLES = '''
@@ -149,10 +157,6 @@ Example from Ansible playbook
             - size_gb: 10
               type: thin
               datastore: g73_datastore
-        nic:
-            - type: vmxnet3
-              network: VM Network
-              network_type: standard
         hardware:
             memory_mb: 512
             num_cpus: 1
@@ -181,11 +185,11 @@ Example from Ansible playbook
        customize: True
        domain: "example.com"
        dns_servers: ['192.168.1.1','192.168.1.2']
-       ips: "192.168.1.100"
        networks:
          '192.168.1.0/24':
            network: 'VM Network'
-           gateway: '192.168.1.1' 
+           gateway: '192.168.1.1'
+           ip: "192.168.1.100"
 #
 # Gather facts only
 #
@@ -282,6 +286,7 @@ HAS_PYVMOMI = False
 try:
     import pyVmomi
     from pyVmomi import vim
+
     HAS_PYVMOMI = True
 except ImportError:
     pass
@@ -292,30 +297,91 @@ from netaddr import IPNetwork, IPAddress
 
 from ansible.module_utils.urls import fetch_url
 
-class PyVmomiHelper(object):
+
+class PyVmomiDeviceHelper(object):
+    """ This class is a helper to create easily VMWare Objects for PyVmomiHelper """
 
     def __init__(self, module):
+        self.module = module
 
+    @staticmethod
+    def create_scsi_controller():
+        scsi_ctl = vim.vm.device.VirtualDeviceSpec()
+        scsi_ctl.operation = vim.vm.device.VirtualDeviceSpec.Operation.add
+        scsi_ctl.device = vim.vm.device.VirtualLsiLogicController()
+        scsi_ctl.device.deviceInfo = vim.Description()
+        scsi_ctl.device.slotInfo = vim.vm.device.VirtualDevice.PciBusSlotInfo()
+        scsi_ctl.device.slotInfo.pciSlotNumber = 16
+        scsi_ctl.device.controllerKey = 100
+        scsi_ctl.device.unitNumber = 3
+        scsi_ctl.device.busNumber = 0
+        scsi_ctl.device.hotAddRemove = True
+        scsi_ctl.device.sharedBus = 'noSharing'
+        scsi_ctl.device.scsiCtlrUnitNumber = 7
+
+        return scsi_ctl
+
+    @staticmethod
+    def create_scsi_disk(scsi_ctl):
+        diskspec = vim.vm.device.VirtualDeviceSpec()
+        diskspec.operation = vim.vm.device.VirtualDeviceSpec.Operation.add
+        diskspec.fileOperation = vim.vm.device.VirtualDeviceSpec.FileOperation.create
+        diskspec.device = vim.vm.device.VirtualDisk()
+        diskspec.device.backing = vim.vm.device.VirtualDisk.FlatVer2BackingInfo()
+        diskspec.device.backing.diskMode = 'persistent'
+        diskspec.device.controllerKey = scsi_ctl.device.key
+
+        return diskspec
+
+    def create_nic(self, device_type, device_label, device_summary):
+        nic = vim.vm.device.VirtualDeviceSpec()
+        if device_type == 'vmxnet3':
+            nic.device = vim.vm.device.VirtualVmxnet3()
+        elif device_type == 'e1000':
+            nic.device = vim.vm.device.VirtualE1000()
+        else:
+            self.module.fail_json(msg="invalid device_type '%s' for network %s" %
+                                      (device_type, device_summary))
+
+        nic.device.wakeOnLanEnabled = True
+        nic.device.addressType = 'assigned'
+        nic.device.deviceInfo = vim.Description()
+        nic.device.deviceInfo.label = device_label
+        nic.device.deviceInfo.summary = device_summary
+        nic.device.connectable = vim.vm.device.VirtualDevice.ConnectInfo()
+        nic.device.connectable.startConnected = True
+        nic.device.connectable.allowGuestControl = True
+        nic.device.connectable.connected = True
+        nic.device.connectable.allowGuestControl = True
+
+        return nic
+
+
+class PyVmomiHelper(object):
+    def __init__(self, module):
         if not HAS_PYVMOMI:
             module.fail_json(msg='pyvmomi module required')
 
         self.module = module
+        self.device_helper = PyVmomiDeviceHelper(self.module)
         self.params = module.params
         self.si = None
-        self.smartconnect()
+        self.content = connect_to_api(self.module)
         self.datacenter = None
         self.folders = None
         self.foldermap = None
+        self.configspec = None
+        self.customspec = None
 
-    def smartconnect(self):
-        self.content = connect_to_api(self.module)
+    def is_template(self):
+        return 'template' in self.params and self.params['template'] is not None
 
-    def _build_folder_tree(self, folder, tree={}, treepath=None):
+    def _build_folder_tree(self, folder):
 
         tree = {'virtualmachines': [],
-                        'subfolders': {},
-                        'vimobj': folder,
-                        'name': folder.name}
+                'subfolders': {},
+                'vimobj': folder,
+                'name': folder.name}
 
         children = None
         if hasattr(folder, 'childEntity'):
@@ -335,19 +401,18 @@ class PyVmomiHelper(object):
                 return folder
         return tree
 
-
     def _build_folder_map(self, folder, vmap={}, inpath='/'):
 
-        ''' Build a searchable index for vms+uuids+folders '''
+        """ Build a searchable index for vms+uuids+folders """
 
         if isinstance(folder, tuple):
             folder = folder[1]
 
-        if not 'names' in vmap:
+        if 'names' not in vmap:
             vmap['names'] = {}
-        if not 'uuids' in vmap:
+        if 'uuids' not in vmap:
             vmap['uuids'] = {}
-        if not 'paths' in vmap:
+        if 'paths' not in vmap:
             vmap['paths'] = {}
 
         if inpath == '/':
@@ -359,22 +424,21 @@ class PyVmomiHelper(object):
             vmap['paths'][thispath] = []
 
         # helpful for isolating folder objects later on
-        if not 'path_by_fvim' in vmap:
+        if 'path_by_fvim' not in vmap:
             vmap['path_by_fvim'] = {}
-        if not 'fvim_by_path' in vmap:
+        if 'fvim_by_path' not in vmap:
             vmap['fvim_by_path'] = {}
         # store object by path and store path by object
         vmap['fvim_by_path'][thispath] = folder['vimobj']
         vmap['path_by_fvim'][folder['vimobj']] = thispath
 
         # helpful for isolating vm objects later on
-        if not 'path_by_vvim' in vmap:
+        if 'path_by_vvim' not in vmap:
             vmap['path_by_vvim'] = {}
-        if not 'vvim_by_path' in vmap:
+        if 'vvim_by_path' not in vmap:
             vmap['vvim_by_path'] = {}
         if thispath not in vmap['vvim_by_path']:
             vmap['vvim_by_path'][thispath] = []
-    
 
         for item in folder.items():
             k = item[0]
@@ -387,7 +451,7 @@ class PyVmomiHelper(object):
                     vmap = self._build_folder_map(x, vmap=vmap, inpath=thispath)
             elif k == 'virtualmachines':
                 for x in v:
-                    if not x.config.name in vmap['names']:
+                    if x.config.name not in vmap['names']:
                         vmap['names'][x.config.name] = []
                     vmap['names'][x.config.name].append(x.config.uuid)
                     vmap['uuids'][x.config.uuid] = x.config.name
@@ -404,11 +468,11 @@ class PyVmomiHelper(object):
         if not self.datacenter:
             self.get_datacenter()
         self.folders = self._build_folder_tree(self.datacenter.vmFolder)
-        self.folder_map = self._build_folder_map(self.folders)
-        return (self.folders, self.folder_map)
+        self.foldermap = self._build_folder_map(self.folders)
 
     def compile_folder_path_for_object(self, vobj):
-        ''' make a /vm/foo/bar/baz like folder path for an object '''
+        """ make a /vm/foo/bar/baz like folder path for an object """
+
         paths = []
         if isinstance(vobj, vim.Folder):
             paths.append(vobj.name)
@@ -424,8 +488,8 @@ class PyVmomiHelper(object):
         return '/' + '/'.join(paths)
 
     def get_datacenter(self):
-        self.datacenter = get_obj(self.content, [vim.Datacenter], 
-                                   self.params['datacenter'])
+        self.datacenter = get_obj(self.content, [vim.Datacenter],
+                                  self.params['datacenter'])
 
     def getvm(self, name=None, uuid=None, folder=None, name_match=None):
 
@@ -433,14 +497,12 @@ class PyVmomiHelper(object):
         # self.si.content.searchIndex.FindByInventoryPath('DC1/vm/test_folder')
 
         vm = None
-        folder_path = None
         searchpath = None
 
         if uuid:
             vm = self.content.searchIndex.FindByUuid(uuid=uuid, vmSearch=True)
 
         elif folder:
-
             if self.params['folder'].endswith('/'):
                 self.params['folder'] = self.params['folder'][0:-1]
 
@@ -455,10 +517,12 @@ class PyVmomiHelper(object):
                 # need to look for matching absolute path
                 if not self.folders:
                     self.getfolders()
-                paths = self.folder_map['paths'].keys()
+                paths = self.foldermap['paths'].keys()
                 paths = [x for x in paths if x.endswith(self.params['folder'])]
                 if len(paths) > 1:
-                    self.module.fail_json(msg='%s matches more than one folder. Please use the absolute path starting with /vm/' % self.params['folder'])
+                    self.module.fail_json(
+                        msg='%s matches more than one folder. Please use the absolute path starting with /vm/' %
+                            self.params['folder'])
                 elif paths:
                     searchpath = paths[0]
 
@@ -476,9 +540,7 @@ class PyVmomiHelper(object):
                             break
 
         if not vm:
-
             # FIXME - this is unused if folder has a default value
-            vmList = get_all_objs(self.content, [vim.VirtualMachine])
 
             # narrow down by folder
             if folder:
@@ -486,6 +548,7 @@ class PyVmomiHelper(object):
                     self.getfolders()
 
                 # compare the folder path of each VM against the search path
+                vmList = get_all_objs(self.content, [vim.VirtualMachine])
                 for item in vmList.items():
                     vobj = item[0]
                     if not isinstance(vobj.parent, vim.Folder):
@@ -498,25 +561,24 @@ class PyVmomiHelper(object):
                     vm = get_obj(self.content, [vim.VirtualMachine], name)
                 elif name_match == 'last':
                     matches = []
-                    vmList = get_all_objs(self.content, [vim.VirtualMachine])
-                    for thisvm in vmList:
+                    for thisvm in get_all_objs(self.content, [vim.VirtualMachine]):
                         if thisvm.config.name == name:
                             matches.append(thisvm)
                     if matches:
                         vm = matches[-1]
-            else:            
+            else:
                 matches = []
-                vmList = get_all_objs(self.content, [vim.VirtualMachine])
-                for thisvm in vmList:
+                for thisvm in get_all_objs(self.content, [vim.VirtualMachine]):
                     if thisvm.config.name == name:
                         matches.append(thisvm)
                     if len(matches) > 1:
-                        module.fail_json(msg='more than 1 vm exists by the name %s. Please specify a uuid, or a folder, or a datacenter or name_match' % name)
+                        self.module.fail_json(
+                            msg='more than 1 vm exists by the name %s. Please specify a uuid, or a folder, '
+                                'or a datacenter or name_match' % name)
                     if matches:
                         vm = matches[0]
 
         return vm
-
 
     def set_powerstate(self, vm, state, force):
         """
@@ -549,11 +611,11 @@ class PyVmomiHelper(object):
                     if current_state in ('poweredon', 'poweringon', 'resetting'):
                         task = vm.Reset()
                     else:
-                        result = {'changed': False, 'failed': True, 
+                        result = {'changed': False, 'failed': True,
                                   'msg': "Cannot restart VM in the current state %s" % current_state}
 
             except Exception:
-                result = {'changed': False, 'failed': True, 
+                result = {'changed': False, 'failed': True,
                           'msg': get_exception()}
 
             if task:
@@ -570,31 +632,29 @@ class PyVmomiHelper(object):
             result['instance'] = facts
         return result
 
-
     def gather_facts(self, vm):
 
-        ''' Gather facts from vim.VirtualMachine object. '''
+        """ Gather facts from vim.VirtualMachine object. """
 
         facts = {
             'module_hw': True,
             'hw_name': vm.config.name,
             'hw_power_status': vm.summary.runtime.powerState,
-            'hw_guest_full_name':  vm.summary.guest.guestFullName,
+            'hw_guest_full_name': vm.summary.guest.guestFullName,
             'hw_guest_id': vm.summary.guest.guestId,
             'hw_product_uuid': vm.config.uuid,
             'hw_processor_count': vm.config.hardware.numCPU,
             'hw_memtotal_mb': vm.config.hardware.memoryMB,
-            'hw_interfaces':[],
+            'hw_interfaces': [],
             'ipv4': None,
             'ipv6': None,
         }
 
         netDict = {}
         for device in vm.guest.net:
-            mac = device.macAddress
-            ips = list(device.ipAddress)
-            netDict[mac] = ips
-        for k,v in netDict.iteritems():
+            netDict[device.macAddress] = list(device.ipAddress)
+
+        for k, v in iteritems(netDict):
             for ipaddress in v:
                 if ipaddress:
                     if '::' in ipaddress:
@@ -602,7 +662,7 @@ class PyVmomiHelper(object):
                     else:
                         facts['ipv4'] = ipaddress
 
-        for idx,entry in enumerate(vm.config.hardware.device):
+        for idx, entry in enumerate(vm.config.hardware.device):
             if not hasattr(entry, 'macAddress'):
                 continue
 
@@ -615,10 +675,9 @@ class PyVmomiHelper(object):
                 'macaddress_dash': entry.macAddress.replace(':', '-'),
                 'summary': entry.deviceInfo.summary,
             }
-            facts['hw_interfaces'].append('eth'+str(idx))
+            facts['hw_interfaces'].append('eth' + str(idx))
 
         return facts
-
 
     def remove_vm(self, vm):
         # https://www.vmware.com/support/developer/converter-sdk/conv60_apireference/vim.ManagedEntity.html#destroy
@@ -626,12 +685,162 @@ class PyVmomiHelper(object):
         self.wait_for_task(task)
 
         if task.info.state == 'error':
-            return ({'changed': False, 'failed': True, 'msg': task.info.error.msg})
+            return {'changed': False, 'failed': True, 'msg': task.info.error.msg}
         else:
-            return ({'changed': True, 'failed': False})
- 
+            return {'changed': True, 'failed': False}
 
-    def deploy_template(self, poweron=False, wait_for_ip=False):
+    def configure_network(self, template):
+        network_devices = list()
+        for network in self.params['networks']:
+            if network:
+                if 'ip' not in self.params['networks'][network]:
+                    self.module.fail_json(msg="ip attribute is missing for network %s" % network)
+
+                ip = self.params['networks'][network]['ip']
+                if ip not in IPNetwork(network):
+                    self.module.fail_json(msg="ip '%s' not in network %s" % (ip, network))
+
+                ipnet = IPNetwork(network)
+                self.params['networks'][network]['subnet_mask'] = str(ipnet.netmask)
+
+                if get_obj(self.content, [vim.Network], self.params['networks'][network]['network']) is None:
+                    self.module.fail_json(msg="Network %s doesn't exists" % network)
+
+                network_devices.append(self.params['networks'][network])
+
+        adaptermaps = []
+
+        for key in range(0, len(network_devices)):
+            if self.is_template():
+                try:
+                    for device in template.config.hardware.device:
+                        if hasattr(device, 'addressType'):
+                            nic = vim.vm.device.VirtualDeviceSpec()
+                            nic.operation = vim.vm.device.VirtualDeviceSpec.Operation.remove
+                            nic.device = device
+                            self.configspec.deviceChange.append(nic)
+                except:
+                    pass
+
+            # Default device type is vmxnet3, VMWare best practice
+            device_type = network_devices[key]['device_type'] \
+                if 'device_type' in network_devices[key] else 'vmxnet3'
+
+            nic = self.device_helper.create_nic(device_type,
+                                                'Network Adapter %s' % (key + 1),
+                                                network_devices[key]['network'])
+            nic.operation = vim.vm.device.VirtualDeviceSpec.Operation.add
+
+            if hasattr(get_obj(self.content, [vim.Network], network_devices[key]['network']), 'portKeys'):
+                # VDS switch
+                pg_obj = get_obj(self.content, [vim.dvs.DistributedVirtualPortgroup], network_devices[key]['network'])
+                dvs_port_connection = vim.dvs.PortConnection()
+                dvs_port_connection.portgroupKey = pg_obj.key
+                dvs_port_connection.switchUuid = pg_obj.config.distributedVirtualSwitch.uuid
+                nic.device.backing = vim.vm.device.VirtualEthernetCard.DistributedVirtualPortBackingInfo()
+                nic.device.backing.port = dvs_port_connection
+            else:
+                # vSwitch
+                nic.device.backing = vim.vm.device.VirtualEthernetCard.NetworkBackingInfo()
+                nic.device.backing.network = get_obj(self.content, [vim.Network], network_devices[key]['network'])
+                nic.device.backing.deviceName = network_devices[key]['network']
+
+            self.configspec.deviceChange.append(nic)
+
+            guest_map = vim.vm.customization.AdapterMapping()
+            guest_map.adapter = vim.vm.customization.IPSettings()
+            guest_map.adapter.ip = vim.vm.customization.FixedIp()
+            guest_map.adapter.ip.ipAddress = str(network_devices[key]['ip'])
+            guest_map.adapter.subnetMask = str(network_devices[key]['subnet_mask'])
+
+            try:
+                guest_map.adapter.gateway = network_devices[key]['gateway']
+            except:
+                pass
+
+            try:
+                guest_map.adapter.dnsDomain = self.params['domain']
+            except:
+                pass
+
+            adaptermaps.append(guest_map)
+
+        # DNS settings
+        globalip = vim.vm.customization.GlobalIPSettings()
+        globalip.dnsServerList = self.params['dns_servers']
+        globalip.dnsSuffixList = str(self.params['domain'])
+
+        # Hostname settings
+        ident = vim.vm.customization.LinuxPrep()
+        ident.domain = str(self.params['domain'])
+        ident.hostName = vim.vm.customization.FixedName()
+        ident.hostName.name = self.params['name']
+
+        self.customspec = vim.vm.customization.Specification()
+        self.customspec.nicSettingMap = adaptermaps
+        self.customspec.globalIPSettings = globalip
+        self.customspec.identity = ident
+
+    def configure_disks(self, template):
+        if self.is_template():
+            # grab the template's first disk and modify it for this customization
+            disks = [x for x in template.config.hardware.device if isinstance(x, vim.vm.device.VirtualDisk)]
+            diskspec = vim.vm.device.VirtualDeviceSpec()
+            # set the operation to edit so that it knows to keep other settings
+            diskspec.operation = vim.vm.device.VirtualDeviceSpec.Operation.edit
+            diskspec.device = disks[0]
+        else:
+            scsi_ctl = self.device_helper.create_scsi_controller()
+            self.configspec.deviceChange.append(scsi_ctl)
+
+            diskspec = self.device_helper.create_scsi_disk(scsi_ctl)
+            # TODO change this ID when looping over disk array
+            diskspec.device.unitNumber = 0
+
+        # get the first disk attributes
+        # @TODO loop over this to create multiple disks
+        pspec = self.params.get('disk')[0]
+
+        # is it thin?
+        if pspec.get('type', '').lower() == 'thin':
+            diskspec.device.backing.thinProvisioned = True
+
+        # which datastore?
+        if pspec.get('datastore'):
+            # This is already handled by the relocation spec,
+            # but it needs to eventually be handled for all the
+            # other disks defined
+            pass
+
+        # what size is it?
+        if [x for x in pspec.keys() if x.startswith('size_') or x == 'size']:
+            # size_tb, size_gb, size_mb, size_kb, size_b ...?
+            if 'size' in pspec:
+                expected = ''.join(c for c in pspec['size'] if c.isdigit())
+                unit = pspec['size'].replace(expected, '').lower()
+                expected = int(expected)
+            else:
+                param = [x for x in pspec.keys() if x.startswith('size_')][0]
+                unit = param.split('_')[-1].lower()
+                expected = [x[1] for x in pspec.items() if x[0].startswith('size_')][0]
+                expected = int(expected)
+
+            kb = None
+            if unit == 'tb':
+                kb = expected * 1024 * 1024 * 1024
+            elif unit == 'gb':
+                kb = expected * 1024 * 1024
+            elif unit == ' mb':
+                kb = expected * 1024
+            elif unit == 'kb':
+                kb = expected
+            else:
+                self.module.fail_json(msg='%s is not a supported unit for disk size' % unit)
+            diskspec.device.capacityInKB = kb
+
+        return diskspec
+
+    def deploy_template(self, wait_for_ip=False):
 
         # https://github.com/vmware/pyvmomi-community-samples/blob/master/samples/clone_vm.py
         # https://www.vmware.com/support/developer/vc-sdk/visdk25pubs/ReferenceGuide/vim.vm.CloneSpec.html
@@ -647,19 +856,13 @@ class PyVmomiHelper(object):
         #   - changing the esx host is ignored?
         #   - static IPs
 
-        # FIXME: need to search for this in the same way as guests to ensure accuracy
-        template = get_obj(self.content, [vim.VirtualMachine], self.params['template'])
-        if not template:
-            self.module.fail_json(msg="Could not find a template named %s" % self.params['template'])
-
         datacenters = get_all_objs(self.content, [vim.Datacenter])
-        datacenter = get_obj(self.content, [vim.Datacenter], 
-                             self.params['datacenter'])
+        datacenter = get_obj(self.content, [vim.Datacenter], self.params['datacenter'])
         if not datacenter:
             self.module.fail_json(msg='No datacenter named %s was found' % self.params['datacenter'])
 
         if not self.foldermap:
-            self.folders, self.foldermap = self.getfolders()
+            self.getfolders()
 
         # find matching folders
         if self.params['folder'].startswith('/'):
@@ -671,7 +874,9 @@ class PyVmomiHelper(object):
         if len(folders) == 0:
             self.module.fail_json(msg='no folder matched the path: %s' % self.params['folder'])
         elif len(folders) > 1:
-            self.module.fail_json(msg='too many folders matched "%s", please give the full path starting with /vm/' % self.params['folder'])
+            self.module.fail_json(
+                msg='too many folders matched "%s", please give the full path starting with /vm/' % self.params[
+                    'folder'])
 
         # grab the folder vim object
         destfolder = folders[0][1]
@@ -681,13 +886,21 @@ class PyVmomiHelper(object):
             cluster = get_obj(self.content, [vim.ClusterComputeResource], self.params['cluster'])
             if not cluster:
                 self.module.fail_json(msg="Failed to find a cluster named %s" % self.params['cluster'])
-            #resource_pool = cluster.resourcePool
+            # resource_pool = cluster.resourcePool
             hostsystems = [x for x in cluster.host]
             hostsystem = hostsystems[0]
         else:
             hostsystem = get_obj(self.content, [vim.HostSystem], self.params['esxi_hostname'])
             if not hostsystem:
                 self.module.fail_json(msg="Failed to find a host named %s" % self.params['esxi_hostname'])
+
+        # FIXME: need to search for this in the same way as guests to ensure accuracy
+        if self.is_template():
+            template = get_obj(self.content, [vim.VirtualMachine], self.params['template'])
+            if not template:
+                self.module.fail_json(msg="Could not find a template named %s" % self.params['template'])
+        else:
+            template = None
 
         # set the destination datastore in the relocation spec
         datastore_name = None
@@ -696,7 +909,7 @@ class PyVmomiHelper(object):
             if 'datastore' in self.params['disk'][0]:
                 datastore_name = self.params['disk'][0]['datastore']
                 datastore = get_obj(self.content, [vim.Datastore], datastore_name)
-        if not datastore:
+        if not datastore and self.is_template():
             # use the template's existing DS
             disks = [x for x in template.config.hardware.device if isinstance(x, vim.vm.device.VirtualDisk)]
             datastore = disks[0].backing.datastore
@@ -719,199 +932,64 @@ class PyVmomiHelper(object):
             if not hasattr(rp[0], 'parent'):
                 continue
             if rp[0].parent == hostsystem.parent:
-                resource_pool = rp[0]    
+                resource_pool = rp[0]
                 break
         if resource_pool:
             relospec.pool = resource_pool
         else:
-            self.module.fail_json(msg="Failed to find a resource group for %s" \
-                                  % hostsystem.name)
+            self.module.fail_json(msg="Failed to find a resource group for %s" % hostsystem.name)
 
-        clonespec_kwargs = {}
-        clonespec_kwargs['location'] = relospec
+        self.configspec = vim.vm.ConfigSpec(cpuHotAddEnabled=True, memoryHotAddEnabled=True)
+        clonespec = vim.vm.CloneSpec(template=self.params['template_flag'],
+                                     location=relospec)
+        self.configspec.deviceChange = []
 
         # create disk spec if not default
         if self.params['disk']:
-            # grab the template's first disk and modify it for this customization
-            disks = [x for x in template.config.hardware.device if isinstance(x, vim.vm.device.VirtualDisk)]
-            diskspec = vim.vm.device.VirtualDeviceSpec()
-            # set the operation to edit so that it knows to keep other settings
-            diskspec.operation = vim.vm.device.VirtualDeviceSpec.Operation.edit
-            diskspec.device = disks[0]
-
-            # get the first disk attributes
-            pspec = self.params.get('disk')[0]
-
-            # is it thin?
-            if pspec.get('type', '').lower() == 'thin':
-                diskspec.device.backing.thinProvisioned = True
-
-            # which datastore?
-            if pspec.get('datastore'):
-                # This is already handled by the relocation spec,
-                # but it needs to eventually be handled for all the
-                # other disks defined
-                pass
-
-            # what size is it?
-            if [x for x in pspec.keys() if x.startswith('size_') or x == 'size']:
-                # size_tb, size_gb, size_mb, size_kb, size_b ...?
-                if 'size' in pspec:
-                    expected = ''.join(c for c in pspec['size'] if c.isdigit())
-                    unit = pspec['size'].replace(expected, '').lower()
-                    expected = int(expected)
-                else:
-                    param = [x for x in pspec.keys() if x.startswith('size_')][0]
-                    unit = param.split('_')[-1].lower()
-                    expected = [x[1] for x in pspec.items() if x[0].startswith('size_')][0]
-                    expected = int(expected)
-
-                kb = None
-                if unit == 'tb':
-                    kb = expected * 1024 * 1024 * 1024
-                elif unit == 'gb':
-                    kb = expected * 1024 * 1024
-                elif unit ==' mb':
-                    kb = expected * 1024
-                elif unit == 'kb':
-                    kb = expected
-                else:
-                    self.module.fail_json(msg='%s is not a supported unit for disk size' % unit)
-                diskspec.device.capacityInKB = kb
-
+            # @TODO get all disks & loop like network cards
             # tell the configspec that the disk device needs to change
-            configspec = vim.vm.ConfigSpec(deviceChange=[diskspec])
-            clonespec_kwargs['config'] = configspec
+            self.configspec.deviceChange.append(self.configure_disks(template=template))
 
         # set cpu/memory/etc
         if 'hardware' in self.params:
-            if not 'config' in clonespec_kwargs:
-                clonespec_kwargs['config'] = vim.vm.ConfigSpec()
             if 'num_cpus' in self.params['hardware']:
-                clonespec_kwargs['config'].numCPUs = \
-                    int(self.params['hardware']['num_cpus'])
+                self.configspec.numCPUs = int(self.params['hardware']['num_cpus'])
+            # num_cpu is mandatory for VM creation
+            elif not self.is_template():
+                self.module.fail_json(msg="hardware.num_cpus attribute is mandatory for VM creation")
+
             if 'memory_mb' in self.params['hardware']:
-                clonespec_kwargs['config'].memoryMB = \
-                    int(self.params['hardware']['memory_mb'])
+                self.configspec.memoryMB = int(self.params['hardware']['memory_mb'])
+            # memory_mb is mandatory for VM creation
+            elif not self.is_template():
+                self.module.fail_json(msg="hardware.memory_mb attribute is mandatory for VM creation")
 
-        # lets try and assign a static ip addresss
+        self.configure_network(template=template)
         if self.params['customize'] is True:
-            ip_settings = list()
-            if self.params['ips']:
-                for ip_string in self.params['ips']:
-                    ip = IPAddress(self.params['ips'])
-                    for network in self.params['networks']:
-                        if network:
-                            if ip in IPNetwork(network):
-                                self.params['networks'][network]['ip'] = str(ip)
-                                ipnet = IPNetwork(network)
-                                self.params['networks'][network]['subnet_mask'] = str(
-                                  ipnet.netmask
-                                )
-                                ip_settings.append(self.params['networks'][network])
+            clonespec.customization = self.customspec
 
-            key = 0
-            network = get_obj(self.content, [vim.Network], ip_settings[key]['network'])
-            datacenter = get_obj(self.content, [vim.Datacenter], self.params['datacenter'])
-            # get the folder where VMs are kept for this datacenter
-            destfolder = datacenter.vmFolder
+        try:
+            if self.is_template():
+                clonespec.config = self.configspec
+                task = template.Clone(folder=destfolder, name=self.params['name'], spec=clonespec)
+            else:
+                # ConfigSpec require name for VM creation
+                self.configspec.name = self.params['name']
+                self.configspec.files = vim.vm.FileInfo(logDirectory=None,
+                                                        snapshotDirectory=None,
+                                                        suspendDirectory=None,
+                                                        vmPathName="[" + datastore_name + "] " + self.params["name"])
 
-            cluster = get_obj(self.content, [vim.ClusterComputeResource],self.params['cluster'])
-
-            devices = []
-            adaptermaps = []
-
-            try:
-                for device in template.config.hardware.device:
-                    if hasattr(device, 'addressType'):
-                        nic = vim.vm.device.VirtualDeviceSpec()
-                        nic.operation = vim.vm.device.VirtualDeviceSpec.Operation.remove
-                        nic.device = device
-                        devices.append(nic)
-            except:
-                pass
-
-                # single device support
-            nic = vim.vm.device.VirtualDeviceSpec()
-            nic.operation = vim.vm.device.VirtualDeviceSpec.Operation.add
-            nic.device = vim.vm.device.VirtualVmxnet3()
-            nic.device.wakeOnLanEnabled = True
-            nic.device.addressType = 'assigned'
-            nic.device.deviceInfo = vim.Description()
-            nic.device.deviceInfo.label = 'Network Adapter %s' % (key + 1)
-            nic.device.deviceInfo.summary = ip_settings[key]['network']
-            
-            if hasattr(get_obj(self.content, [vim.Network], ip_settings[key]['network']), 'portKeys'):
-            # VDS switch
-                pg_obj = get_obj(self.content, [vim.dvs.DistributedVirtualPortgroup], ip_settings[key]['network'])
-                dvs_port_connection = vim.dvs.PortConnection()
-                dvs_port_connection.portgroupKey= pg_obj.key
-                dvs_port_connection.switchUuid= pg_obj.config.distributedVirtualSwitch.uuid
-                nic.device.backing = vim.vm.device.VirtualEthernetCard.DistributedVirtualPortBackingInfo()
-                nic.device.backing.port = dvs_port_connection 
-
-            else: 
-            # vSwitch
-                nic.device.backing = vim.vm.device.VirtualEthernetCard.NetworkBackingInfo()
-                nic.device.backing.network = get_obj(self.content, [vim.Network], ip_settings[key]['network'])
-                nic.device.backing.deviceName = ip_settings[key]['network']
-
-            nic.device.connectable = vim.vm.device.VirtualDevice.ConnectInfo()
-            nic.device.connectable.startConnected = True
-            nic.device.connectable.allowGuestControl = True
-            nic.device.connectable.connected = True
-            nic.device.connectable.allowGuestControl = True
-            devices.append(nic)
-            
-            # Update the spec with the added NIC
-            clonespec_kwargs['config'].deviceChange = devices
-
-            guest_map = vim.vm.customization.AdapterMapping()
-            guest_map.adapter = vim.vm.customization.IPSettings()
-            guest_map.adapter.ip = vim.vm.customization.FixedIp()
-            guest_map.adapter.ip.ipAddress = str(ip_settings[key]['ip'])
-            guest_map.adapter.subnetMask = str(ip_settings[key]['subnet_mask'])
-
-            try:
-                guest_map.adapter.gateway = ip_settings[key]['gateway']
-            except:
-                pass
-
-            try:
-                guest_map.adapter.dnsDomain = self.params['domain']
-            except:
-                pass
-
-            adaptermaps.append(guest_map)
-
-            # DNS settings
-            globalip = vim.vm.customization.GlobalIPSettings()
-            globalip.dnsServerList = self.params['dns_servers']
-            globalip.dnsSuffixList = str(self.params['domain'])
-
-            # Hostname settings
-            ident = vim.vm.customization.LinuxPrep()
-            ident.domain = str(self.params['domain'])
-            ident.hostName = vim.vm.customization.FixedName()
-            ident.hostName.name = self.params['name']
-
-            customspec = vim.vm.customization.Specification()
-            clonespec_kwargs['customization'] = customspec
-
-            clonespec_kwargs['customization'].nicSettingMap = adaptermaps
-            clonespec_kwargs['customization'].globalIPSettings = globalip
-            clonespec_kwargs['customization'].identity = ident
-
-        clonespec = vim.vm.CloneSpec(**clonespec_kwargs)
-        task = template.Clone(folder=destfolder, name=self.params['name'], spec=clonespec)
-        self.wait_for_task(task)
+                task = destfolder.CreateVM_Task(config=self.configspec, pool=resource_pool)
+            self.wait_for_task(task)
+        except TypeError:
+            self.module.fail_json(msg="TypeError was returned, please ensure to give correct inputs.")
 
         if task.info.state == 'error':
             # https://kb.vmware.com/selfservice/microsites/search.do?language=en_US&cmd=displayKC&externalId=2021361
             # https://kb.vmware.com/selfservice/microsites/search.do?language=en_US&cmd=displayKC&externalId=2173
-            return ({'changed': False, 'failed': True, 'msg': task.info.error.msg})
+            return {'changed': False, 'failed': True, 'msg': task.info.error.msg}
         else:
-
             # set annotation
             vm = task.info.result
             if self.params['annotation']:
@@ -919,11 +997,13 @@ class PyVmomiHelper(object):
                 annotation_spec.annotation = str(self.params['annotation'])
                 task = vm.ReconfigVM_Task(annotation_spec)
                 self.wait_for_task(task)
+
             if wait_for_ip:
                 self.set_powerstate(vm, 'poweredon', force=False)
                 self.wait_for_vm_ip(vm)
+
             vm_facts = self.gather_facts(vm)
-            return ({'changed': True, 'failed': False, 'instance': vm_facts})
+            return {'changed': True, 'failed': False, 'instance': vm_facts}
 
     def wait_for_task(self, task):
         # https://www.vmware.com/support/developer/vc-sdk/visdk25pubs/ReferenceGuide/vim.Task.html
@@ -932,7 +1012,7 @@ class PyVmomiHelper(object):
         while task.info.state not in ['success', 'error']:
             time.sleep(1)
 
-    def wait_for_vm_ip(self, vm, poll=100, sleep=5):            
+    def wait_for_vm_ip(self, vm, poll=100, sleep=5):
         ips = None
         facts = {}
         thispoll = 0
@@ -947,16 +1027,14 @@ class PyVmomiHelper(object):
 
         return facts
 
-
     def fetch_file_from_guest(self, vm, username, password, src, dest):
 
-        ''' Use VMWare's filemanager api to fetch a file over http '''
+        """ Use VMWare's filemanager api to fetch a file over http """
 
         result = {'failed': False}
 
         tools_status = vm.guest.toolsStatus
-        if (tools_status == 'toolsNotInstalled' or
-                tools_status == 'toolsNotRunning'):
+        if tools_status == 'toolsNotInstalled' or tools_status == 'toolsNotRunning':
             result['failed'] = True
             result['msg'] = "VMwareTools is not installed or is not running in the guest"
             return result
@@ -968,18 +1046,18 @@ class PyVmomiHelper(object):
 
         # https://github.com/vmware/pyvmomi/blob/master/docs/vim/vm/guest/FileManager/FileTransferInformation.rst
         fti = self.content.guestOperationsManager.fileManager. \
-                            InitiateFileTransferFromGuest(vm, creds, src)
+            InitiateFileTransferFromGuest(vm, creds, src)
 
         result['size'] = fti.size
         result['url'] = fti.url
 
         # Use module_utils to fetch the remote url returned from the api
-        rsp, info = fetch_url(self.module, fti.url, use_proxy=False, 
-                             force=True, last_mod_time=None, 
-                             timeout=10, headers=None)
+        rsp, info = fetch_url(self.module, fti.url, use_proxy=False,
+                              force=True, last_mod_time=None,
+                              timeout=10, headers=None)
 
         # save all of the transfer data
-        for k,v in info.iteritems():
+        for k, v in iteritems(info):
             result[k] = v
 
         # exit early if xfer failed
@@ -990,23 +1068,21 @@ class PyVmomiHelper(object):
         # attempt to read the content and write it
         try:
             with open(dest, 'wb') as f:
-                f.write(rsp.read())        
+                f.write(rsp.read())
         except Exception as e:
             result['failed'] = True
             result['msg'] = str(e)
 
         return result
 
-
     def push_file_to_guest(self, vm, username, password, src, dest, overwrite=True):
 
-        ''' Use VMWare's filemanager api to push a file over http '''
+        """ Use VMWare's filemanager api to fetch a file over http """
 
         result = {'failed': False}
 
         tools_status = vm.guest.toolsStatus
-        if (tools_status == 'toolsNotInstalled' or
-                tools_status == 'toolsNotRunning'):
+        if tools_status == 'toolsNotInstalled' or tools_status == 'toolsNotRunning':
             result['failed'] = True
             result['msg'] = "VMwareTools is not installed or is not running in the guest"
             return result
@@ -1017,12 +1093,10 @@ class PyVmomiHelper(object):
         )
 
         # the api requires a filesize in bytes
-        filesize = None
         fdata = None
         try:
-            #filesize = os.path.getsize(src)
+            # filesize = os.path.getsize(src)
             filesize = os.stat(src).st_size
-            fdata = None
             with open(src, 'rb') as f:
                 fdata = f.read()
             result['local_filesize'] = filesize
@@ -1034,22 +1108,21 @@ class PyVmomiHelper(object):
         # https://www.vmware.com/support/developer/converter-sdk/conv60_apireference/vim.vm.guest.FileManager.html#initiateFileTransferToGuest
         file_attribute = vim.vm.guest.FileManager.FileAttributes()
         url = self.content.guestOperationsManager.fileManager. \
-                InitiateFileTransferToGuest(vm, creds, dest, file_attribute, 
-                                            filesize, overwrite)
+            InitiateFileTransferToGuest(vm, creds, dest, file_attribute,
+                                        filesize, overwrite)
 
         # PUT the filedata to the url ...
         rsp, info = fetch_url(self.module, url, method="put", data=fdata,
-                             use_proxy=False, force=True, last_mod_time=None, 
-                             timeout=10, headers=None)
+                              use_proxy=False, force=True, last_mod_time=None,
+                              timeout=10, headers=None)
 
         result['msg'] = str(rsp.read())
 
         # save all of the transfer data
-        for k,v in info.iteritems():
+        for k, v in iteritems(info):
             result[k] = v
 
         return result
-
 
     def run_command_in_guest(self, vm, username, password, program_path, program_args, program_cwd, program_env):
 
@@ -1057,7 +1130,7 @@ class PyVmomiHelper(object):
 
         tools_status = vm.guest.toolsStatus
         if (tools_status == 'toolsNotInstalled' or
-                tools_status == 'toolsNotRunning'):
+                    tools_status == 'toolsNotRunning'):
             result['failed'] = True
             result['msg'] = "VMwareTools is not installed or is not running in the guest"
             return result
@@ -1067,19 +1140,18 @@ class PyVmomiHelper(object):
             username=username, password=password
         )
 
-        res = None
-        pdata = None
         try:
             # https://github.com/vmware/pyvmomi/blob/master/docs/vim/vm/guest/ProcessManager.rst
             pm = self.content.guestOperationsManager.processManager
             # https://www.vmware.com/support/developer/converter-sdk/conv51_apireference/vim.vm.guest.ProcessManager.ProgramSpec.html
             ps = vim.vm.guest.ProcessManager.ProgramSpec(
-                #programPath=program,
-                #arguments=args
+                # programPath=program,
+                # arguments=args
                 programPath=program_path,
                 arguments=program_args,
                 workingDirectory=program_cwd,
             )
+
             res = pm.StartProgramInGuest(vm, creds, ps)
             result['pid'] = res
             pdata = pm.ListProcessesInGuest(vm, creds, [res])
@@ -1088,6 +1160,7 @@ class PyVmomiHelper(object):
             while not pdata[0].endTime:
                 time.sleep(1)
                 pdata = pm.ListProcessesInGuest(vm, creds, [res])
+
             result['owner'] = pdata[0].owner
             result['startTime'] = pdata[0].startTime.isoformat()
             result['endTime'] = pdata[0].endTime.isoformat()
@@ -1106,14 +1179,14 @@ class PyVmomiHelper(object):
 
     def list_snapshots_recursively(self, snapshots):
         snapshot_data = []
-        snap_text = ''
         for snapshot in snapshots:
-            snap_text = 'Id: %s; Name: %s; Description: %s; CreateTime: %s; State: %s'%(snapshot.id, snapshot.name,
-                            snapshot.description, snapshot.createTime, snapshot.state)
+            snap_text = 'Id: %s; Name: %s; Description: %s; CreateTime: %s; State: %s' % (snapshot.id, snapshot.name,
+                                                                                          snapshot.description,
+                                                                                          snapshot.createTime,
+                                                                                          snapshot.state)
             snapshot_data.append(snap_text)
             snapshot_data = snapshot_data + self.list_snapshots_recursively(snapshot.childSnapshotList)
         return snapshot_data
-
 
     def get_snapshots_by_name_recursively(self, snapshots, snapname):
         snap_obj = []
@@ -1133,8 +1206,9 @@ class PyVmomiHelper(object):
         return snap_obj
 
     def snapshot_vm(self, vm, guest, snapshot_op):
-        ''' To perform snapshot operations create/remove/revert/list_all/list_current/remove_all '''
+        """ To perform snapshot operations create/remove/revert/list_all/list_current/remove_all """
 
+        snapshot_op_name = None
         try:
             snapshot_op_name = snapshot_op['op_type']
         except KeyError:
@@ -1147,7 +1221,7 @@ class PyVmomiHelper(object):
             self.module.fail_json(msg="Specify op_type - create/remove/revert/list_all/list_current/remove_all")
 
         if snapshot_op_name != 'create' and vm.snapshot is None:
-            self.module.exit_json(msg="VM - %s doesn't have any snapshots"%guest)
+            self.module.exit_json(msg="VM - %s doesn't have any snapshots" % guest)
 
         if snapshot_op_name == 'create':
             try:
@@ -1172,7 +1246,7 @@ class PyVmomiHelper(object):
 
             snap_obj = self.get_snapshots_by_name_recursively(vm.snapshot.rootSnapshotList, snapname)
 
-            #if len(snap_obj) is 0; then no snapshots with specified name
+            # if len(snap_obj) is 0; then no snapshots with specified name
             if len(snap_obj) == 1:
                 snap_obj = snap_obj[0].snapshot
                 if snapshot_op_name == 'remove':
@@ -1180,7 +1254,8 @@ class PyVmomiHelper(object):
                 else:
                     task = snap_obj.RevertToSnapshot_Task()
             else:
-                self.module.exit_json(msg="Couldn't find any snapshots with specified name: %s on VM: %s"%(snapname, guest))
+                self.module.exit_json(
+                    msg="Couldn't find any snapshots with specified name: %s on VM: %s" % (snapname, guest))
 
         elif snapshot_op_name == 'list_all':
             snapshot_data = self.list_snapshots_recursively(vm.snapshot.rootSnapshotList)
@@ -1189,9 +1264,10 @@ class PyVmomiHelper(object):
         elif snapshot_op_name == 'list_current':
             current_snapref = vm.snapshot.currentSnapshot
             current_snap_obj = self.get_current_snap_obj(vm.snapshot.rootSnapshotList, current_snapref)
-            result['current_snapshot'] = 'Id: %s; Name: %s; Description: %s; CreateTime: %s; State: %s'%(current_snap_obj[0].id,
-                            current_snap_obj[0].name, current_snap_obj[0].description, current_snap_obj[0].createTime,
-                            current_snap_obj[0].state)
+            result['current_snapshot'] = 'Id: %s; Name: %s; Description: %s; CreateTime: %s; State: %s' % (
+                current_snap_obj[0].id,
+                current_snap_obj[0].name, current_snap_obj[0].description, current_snap_obj[0].createTime,
+                current_snap_obj[0].state)
 
         elif snapshot_op_name == 'remove_all':
             task = vm.RemoveAllSnapshots()
@@ -1204,6 +1280,7 @@ class PyVmomiHelper(object):
                 result = {'changed': True, 'failed': False}
 
         return result
+
 
 def get_obj(content, vimtype, name):
     """
@@ -1227,9 +1304,6 @@ def get_obj(content, vimtype, name):
 
 
 def main():
-
-    vm = None
-
     module = AnsibleModule(
         argument_spec=dict(
             hostname=dict(
@@ -1256,7 +1330,8 @@ def main():
                 ],
                 default='present'),
             validate_certs=dict(required=False, type='bool', default=True),
-            template_src=dict(required=False, type='str', aliases=['template']),
+            template_src=dict(required=False, type='str', aliases=['template'], default=None),
+            template_flag=dict(required=False, type='bool', default=False),
             annotation=dict(required=False, type='str', aliases=['notes']),
             name=dict(required=True, type='str'),
             name_match=dict(required=False, type='str', default='first'),
@@ -1272,7 +1347,6 @@ def main():
             cluster=dict(required=False, type='str', default=None),
             wait_for_ip_address=dict(required=False, type='bool', default=True),
             customize=dict(required=False, type='bool', default=False),
-            ips=dict(required=False, type='str', default=None),
             dns_servers=dict(required=False, type='list', default=None),
             domain=dict(required=False, type='str', default=None),
             networks=dict(required=False, type='dict', default={})
@@ -1285,22 +1359,22 @@ def main():
         ],
     )
 
-    pyv = PyVmomiHelper(module)
+    result = {'failed': False, 'changed': True}
 
+    pyv = PyVmomiHelper(module)
     # Check if the VM exists before continuing
-    vm = pyv.getvm(name=module.params['name'], 
-                   folder=module.params['folder'], 
-                   uuid=module.params['uuid'], 
+    vm = pyv.getvm(name=module.params['name'],
+                   folder=module.params['folder'],
+                   uuid=module.params['uuid'],
                    name_match=module.params['name_match'])
 
     # VM already exists
     if vm:
-
         if module.params['state'] == 'absent':
             # destroy it
             if module.params['force']:
                 # has to be poweredoff first
-                result = pyv.set_powerstate(vm, 'poweredoff', module.params['force'])
+                pyv.set_powerstate(vm, 'poweredoff', module.params['force'])
             result = pyv.remove_vm(vm)
         elif module.params['state'] in ['poweredon', 'poweredoff', 'restarted']:
             # set powerstate
@@ -1313,27 +1387,19 @@ def main():
                 module.exit_json(instance=pyv.gather_facts(vm))
             except Exception:
                 e = get_exception()
-                module.fail_json(
-                    msg="Fact gather failed with exception %s" % e)
+                module.fail_json(msg="Fact gather failed with exception %s" % e)
 
     # VM doesn't exist
     else:
         create_states = ['poweredon', 'poweredoff', 'present', 'restarted']
         if module.params['state'] in create_states:
-            poweron = (module.params['state'] != 'poweredoff')
             # Create it ...
             result = pyv.deploy_template(
-                        poweron=poweron, 
-                        wait_for_ip=module.params['wait_for_ip_address']
-                     )
+                wait_for_ip=module.params['wait_for_ip_address']
+            )
             result['changed'] = True
-        elif module.params['state'] == 'absent':
-            result = {'changed': False, 'failed': False}
-        else:
-            result = {'changed': False, 'failed': False}
 
-    # FIXME
-    if not 'failed' in result:
+    if 'failed' not in result:
         result['failed'] = False
 
     if result['failed']:
